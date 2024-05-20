@@ -1,0 +1,201 @@
+
+#define BLYNK_AUTH_TOKEN "Nlt0lT84vjsWog1sx6QgQzsxdMclip3B"
+
+#define BLYNK_PRINT Serial
+#include <BlynkSimpleEsp32.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+
+#define TdsSensorPin 35
+#define VREF 3.3              // analog reference voltage(Volt) of the ADC
+#define SCOUNT  30          // sum of sample point
+
+#define RELAY_PIN 26
+#define SOUND_SPEED 0.034
+#define CM_TO_INCH 0.393701
+
+int analogBuffer[SCOUNT];     // store the analog value in the array, read from ADC
+int analogBufferTemp[SCOUNT];
+int analogBufferIndex = 0;
+int copyIndex = 0;
+
+float averageVoltage = 0;
+float tdsValue = 0;
+float temperature = 25;       // current temperature for compensation
+
+const char ssid[] = "motoritik";
+const char password[] = "ritik735";
+const char auth[] = BLYNK_AUTH_TOKEN;
+
+const int trigPin = 5;
+const int echoPin = 18;
+float waterLevel;
+long duration;
+float distanceCm;
+int wantedCapacity = 100;
+int relayControlEnabled;
+
+// for sending tds value to blynk
+BLYNK_WRITE(V2)
+{
+  wantedCapacity = param.asInt();
+  Serial.println(wantedCapacity);
+}
+
+// for controlling the motor
+BLYNK_WRITE(V3) {
+  if (param.asInt() == 1) {
+    relayControlEnabled = 1;
+    checkWaterLevel();
+  } else {
+    relayControlEnabled = 0;
+    digitalWrite(RELAY_PIN, HIGH);
+    Serial.println("MOTOR OFF");
+  }
+  Serial.println(relayControlEnabled ? "Yes" : "No");
+}
+
+// median filtering algorithm
+int getMedianNum(int bArray[], int iFilterLen){
+  int bTab[iFilterLen];
+  for (byte i = 0; i<iFilterLen; i++)
+    bTab[i] = bArray[i];
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0){
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  }
+  else {
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  }
+  return bTemp;
+}
+
+void checkWaterLevel() {
+  if (relayControlEnabled) {
+    if (waterLevel >= -5 && waterLevel < wantedCapacity ) {
+      digitalWrite(RELAY_PIN, LOW);
+      Serial.println("MOTOR ON");
+    } else {
+      digitalWrite(RELAY_PIN, HIGH);
+      Serial.println("MOTOR OFF");
+    }
+  } 
+}
+
+void setup() {
+  Serial.begin(115200);
+  connectToWiFi();
+  Blynk.begin(auth, ssid, password);
+  pinMode(trigPin, OUTPUT); // Sets the trigPin as an Output
+  pinMode(echoPin, INPUT); // Sets the echoPin as an Input
+  pinMode(TdsSensorPin,INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+  Blynk.syncVirtual(V2);
+  Blynk.syncVirtual(V3);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    delay(2000);
+    connectToWiFi();
+  } else {
+    digitalWrite(trigPin, LOW);
+    // Sets the trigPin on HIGH state for 10 micro seconds
+    delayMicroseconds(2);
+    digitalWrite(trigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPin, LOW);
+
+    // Reads the echoPin, returns the sound wave travel time in microseconds
+    duration = pulseIn(echoPin, HIGH);
+
+    // Calculate the distance in cm
+    distanceCm = duration * SOUND_SPEED / 2;
+    Serial.print("Distance (cm): ");
+    Serial.println(distanceCm,2);
+    delay(500);
+
+    // Calculate water level
+    waterLevel = distanceCm - 5.20;
+    waterLevel = (10 * waterLevel);
+    waterLevel = 100 - waterLevel;
+    waterLevel = (int)waterLevel;
+    Serial.print("waterLevel :");
+    Serial.println(waterLevel);
+    checkWaterLevel();
+
+    static unsigned long analogSampleTimepoint = millis();
+    if(millis()-analogSampleTimepoint > 40U){     //every 40 milliseconds,read the analog value from the ADC
+      analogSampleTimepoint = millis();
+      analogBuffer[analogBufferIndex] = analogRead(TdsSensorPin);    //read the analog value and store into the buffer
+      analogBufferIndex++;
+      if(analogBufferIndex == SCOUNT){ 
+        analogBufferIndex = 0;
+      }
+    }   
+    
+    static unsigned long printTimepoint = millis();
+    if(millis()-printTimepoint > 800U){
+      printTimepoint = millis();
+      for(copyIndex=0; copyIndex<SCOUNT; copyIndex++){
+        analogBufferTemp[copyIndex] = analogBuffer[copyIndex];
+        
+        // read the analog value more stable by the median filtering algorithm, and convert to voltage value
+        averageVoltage = getMedianNum(analogBufferTemp,SCOUNT) * (float)VREF / 4096.0;
+        
+        //temperature compensation formula: fFinalResult(25^C) = fFinalResult(current)/(1.0+0.02*(fTP-25.0)); 
+        float compensationCoefficient = 1.0+0.02*(temperature-25.0);
+        //temperature compensation
+        float compensationVoltage=averageVoltage/compensationCoefficient;
+        
+        //convert voltage value to tds value
+        tdsValue=(133.42*compensationVoltage*compensationVoltage*compensationVoltage - 255.86*compensationVoltage*compensationVoltage + 857.39*compensationVoltage)*0.5;
+        
+        // Serial.print("voltage:");
+        // Serial.print(averageVoltage,2);
+        // Serial.print("V   ");
+        Serial.print("TDS Value:");
+        Serial.print(tdsValue,0);
+        Serial.println("ppm");
+      }
+    }
+    if(tdsValue > 500)
+    {
+    String message = "ALERT ! IMPURITY Detected in Water, TDS Value is : " + String(tdsValue) + "ppm";
+    //Blynk.notify(message); // Send notification
+    Blynk.logEvent("impurity_alert", message); // Log event (optional)
+   // Blynk.email("vermasamrat13@gmail.com", "Alert", message);
+
+    }
+    sendBlynk(waterLevel,tdsValue);
+    Blynk.run();
+    delay(2000);
+    Serial.println("Wanted Capa :");
+    Serial.println(wantedCapacity);
+  }
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+}
+
+void sendBlynk(int WaterLevel, int TDS ){
+  Blynk.virtualWrite(V0, WaterLevel);
+  Blynk.virtualWrite(V1, TDS);
+  }
